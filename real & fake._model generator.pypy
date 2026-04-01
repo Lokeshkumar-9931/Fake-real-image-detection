@@ -1,0 +1,210 @@
+import os
+import sys
+import argparse
+import numpy as np
+import tensorflow as tf
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+@tf.function
+def apply_high_pass_filter(images, labels):
+    # images arrive in batches: (Batch, Height, Width, Channels)
+    img_float = tf.cast(images, tf.float32)
+    img_complex = tf.cast(img_float, tf.complex64)
+    
+    # Transpose to (Batch, Channels, Height, Width) for 2D Spatial FFT
+    img_t = tf.transpose(img_complex, [0, 3, 1, 2])
+    
+    fft = tf.signal.fft2d(img_t)
+    fft_shift = tf.signal.fftshift(fft, axes=[2, 3])
+    
+    # Create the high-pass mask
+    shape = tf.shape(img_t)
+    h, w = shape[2], shape[3]
+    center_y, center_x = tf.cast(h // 2, tf.float32), tf.cast(w // 2, tf.float32)
+    radius = 15.0 # Cutoff radius
+    
+    y, x = tf.meshgrid(tf.range(tf.cast(h, tf.float32)), tf.range(tf.cast(w, tf.float32)), indexing='ij')
+    dist = tf.sqrt(tf.square(x - center_x) + tf.square(y - center_y))
+    mask = dist > radius
+    mask = tf.cast(mask, tf.complex64)
+    
+    # Expand mask to match dimensions: (1, 1, Height, Width) to broadcast across Batch & Channels
+    mask = tf.expand_dims(tf.expand_dims(mask, 0), 0)
+    
+    # Apply mask and inverse FFT
+    fft_shift = fft_shift * mask
+    ifft = tf.signal.ifft2d(tf.signal.ifftshift(fft_shift, axes=[2, 3]))
+    
+    # Transpose back to (Batch, Height, Width, Channels) and get magnitude
+    high_freq_img = tf.abs(tf.transpose(ifft, [0, 2, 3, 1]))
+    
+    # Blend and clip to ensure valid pixel ranges [0, 255]
+    image_blended = img_float + (high_freq_img * 0.1)
+    image_blended = tf.clip_by_value(image_blended, 0.0, 255.0)
+    
+    return image_blended, labels
+
+# ==========================================
+# STEP 5.2: DATASET LOADING
+# ==========================================
+def load_data(data_dir, batch_size=32):
+
+    train_dataset = tf.keras.utils.image_dataset_from_directory(
+        data_dir,
+        validation_split=0.2,
+        subset="training",
+        seed=42,
+        image_size=(224, 224),
+        batch_size=batch_size,
+        shuffle=True
+    )
+    
+
+    test_dataset = tf.keras.utils.image_dataset_from_directory(
+        data_dir,
+        validation_split=0.2,
+        subset="validation",
+        seed=42,
+        image_size=(224, 224),
+        batch_size=batch_size,
+        shuffle=False 
+    )
+    
+    classes = train_dataset.class_names
+    
+    
+    train_dataset = train_dataset.map(apply_high_pass_filter, num_parallel_calls=tf.data.AUTOTUNE)
+    test_dataset = test_dataset.map(apply_high_pass_filter, num_parallel_calls=tf.data.AUTOTUNE)
+    
+    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
+    test_dataset = test_dataset.prefetch(tf.data.AUTOTUNE)
+    
+    return train_dataset, test_dataset, classes
+def build_model():
+    
+    data_augmentation = tf.keras.Sequential([
+        tf.keras.layers.RandomFlip("horizontal"),
+        tf.keras.layers.RandomRotation(0.027), # approx 10 degrees
+    ], name="data_augmentation")
+
+    
+    base_model = tf.keras.applications.EfficientNetB0(
+        include_top=False, 
+        weights='imagenet', 
+        input_shape=(224, 224, 3)
+    )
+    
+    
+    base_model.trainable = False
+    
+
+    for layer in base_model.layers[-20:]:
+        
+        if not isinstance(layer, tf.keras.layers.BatchNormalization):
+            layer.trainable = True
+
+    # Assemble the final model Architecture
+    inputs = tf.keras.Input(shape=(224, 224, 3))
+    x = data_augmentation(inputs)
+    x = base_model(x, training=False) # Keep base_model in inference mode for safe fine-tuning
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+    outputs = tf.keras.layers.Dense(1, activation='sigmoid')(x)
+    
+    model = tf.keras.Model(inputs, outputs)
+    return model
+
+# ==========================================
+# STEP 5.3 & 5.4: TRAINING & EVALUATION PIPELINE
+# ==========================================
+def train_and_evaluate(data_dir, num_epochs=5):
+    print("\n--- GPU Check ---")
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        print(f"TensorFlow found GPU: {gpus[0]}")
+    else:
+        print("No GPU detected. Training on CPU.")
+
+    print("\n--- Loading Data ---")
+    train_dataset, test_dataset, classes = load_data(data_dir)
+    print(f"Classes found: {classes} (0: {classes[0]}, 1: {classes[1]})")
+    
+    model = build_model()
+    
+    # Compile the model
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss=tf.keras.losses.BinaryCrossentropy(),
+        metrics=['accuracy']
+    )
+
+    print("\n--- Starting Training ---")
+    # tf.keras model.fit handles all the manual batching, loss calculation, and updating for us
+    model.fit(
+        train_dataset,
+        validation_data=test_dataset,
+        epochs=num_epochs
+    )
+
+    print("\n--- Starting Evaluation ---")
+    all_labels = []
+    
+    # Extract true labels from the un-shuffled test dataset
+    for images, labels in test_dataset:
+        all_labels.extend(labels.numpy())
+        
+    # Get model predictions
+    predictions = model.predict(test_dataset)
+    all_preds = (predictions > 0.5).astype(int).flatten()
+
+    # Calculate Metrics
+    acc = accuracy_score(all_labels, all_preds)
+    prec = precision_score(all_labels, all_preds, zero_division=0)
+    rec = recall_score(all_labels, all_preds, zero_division=0)
+    f1 = f1_score(all_labels, all_preds, zero_division=0)
+
+    print("\n" + "=" * 30)
+    print(" MODEL PERFORMANCE METRICS")
+    print("=" * 30)
+    print(f"Accuracy:  {acc * 100:.2f}%")
+    print(f"Precision: {prec * 100:.2f}%")
+    print(f"Recall:    {rec * 100:.2f}%")
+    print(f"F1-Score:  {f1 * 100:.2f}%")
+    
+    # Save the trained model in Keras format
+    model.save("ai_detector_model.keras")
+    print("\n[SUCCESS] Model saved as 'ai_detector_model.keras'")
+
+if __name__ == "__main__":
+    # Setup Argument Parser for command line execution
+    parser = argparse.ArgumentParser(description="Train an AI Image Detector (TensorFlow)")
+    parser.add_argument('--data_dir', type=str, help='Path to the dataset directory containing "real" and "fake" folders.')
+    parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs (default is 5).')
+    args = parser.parse_args()
+
+    dataset_path = args.data_dir
+
+    # If no command line argument was passed, ask the user interactively
+    if not dataset_path:
+        print("Welcome to the TensorFlow AI Image Detector Training Pipeline!")
+        dataset_path = input("Please enter the full path to your dataset folder: ").strip()
+        
+        # Clean quotes if the user dragged and dropped a folder into the terminal
+        dataset_path = dataset_path.strip("\"'") 
+
+    # --- Directory Validation ---
+    if not os.path.exists(dataset_path):
+        print(f"\n[ERROR] The directory '{dataset_path}' does not exist. Please check your path.")
+        sys.exit(1)
+
+    real_dir = os.path.join(dataset_path, "real")
+    fake_dir = os.path.join(dataset_path, "fake")
+
+    if not os.path.exists(real_dir) or not os.path.exists(fake_dir):
+        print("\n[ERROR] Invalid dataset structure.")
+        print(f"Your dataset folder must contain exactly two subfolders named 'real' and 'fake'.")
+        sys.exit(1)
+
+    # If validation passes, start training
+    print(f"\nDataset validated successfully at: {dataset_path}")
+    train_and_evaluate(dataset_path, num_epochs=args.epochs)
